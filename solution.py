@@ -16,7 +16,8 @@ from util import ece, ParameterDistribution
 EXTENDED_EVALUATION = False
 
 
-def run_solution(dataset_train: torch.utils.data.Dataset, data_dir: str = os.curdir, output_dir: str = '/results/') -> 'Model':
+def run_solution(dataset_train: torch.utils.data.Dataset, data_dir: str = os.curdir,
+                 output_dir: str = '/results/') -> 'Model':
     """
     Run your task 2 solution.
     This method should train your model, evaluate it, and return the trained model at the end.
@@ -161,6 +162,7 @@ class BayesianLayer(nn.Module):
     It maintains a prior and variational posterior for the weights (and biases)
     and uses sampling to approximate the gradients via Bayes by backprop.
     """
+
     def __init__(self, in_features: int, out_features: int, bias: bool = True):
         """
         Create a BayesianLayer.
@@ -174,38 +176,33 @@ class BayesianLayer(nn.Module):
         self.out_features = out_features
         self.use_bias = bias
 
-        # TODO: Create a suitable prior for weights and biases as an instance of ParameterDistribution.
-        #  You can use the same prior for both weights and biases, but are free to experiment with different priors.
-        #  You can create constants using torch.tensor(...).
-        #  Do NOT use torch.Parameter(...) here since the prior should not be optimized!
-        #  Example: self.prior = MyPrior(torch.tensor(0.0), torch.tensor(1.0))
-        self.prior = None
-        assert isinstance(self.prior, ParameterDistribution)
-        assert not any(True for _ in self.prior.parameters()), 'Prior cannot have parameters'
+        # Can tune these parameters if necessary
+        RHO_1 = 1.7
+        RHO_2 = 0.0001
+        ALPHA = 0.5
 
-        # TODO: Create a suitable variational posterior for weights as an instance of ParameterDistribution.
-        #  You need to create separate ParameterDistribution instances for weights and biases,
-        #  but can use the same family of distributions if you want.
-        #  IMPORTANT: You need to create a nn.Parameter(...) for each parameter
-        #  and add those parameters as an attribute in the ParameterDistribution instances.
-        #  If you forget to do so, PyTorch will not be able to optimize your variational posterior.
-        #  Example: self.weights_var_posterior = MyPosterior(
-        #      torch.nn.Parameter(torch.zeros((out_features, in_features))),
-        #      torch.nn.Parameter(torch.ones((out_features, in_features)))
-        #  )
-        self.weights_var_posterior = None
+        self.weights_prior = ScaleMixtureMVGaussian(RHO_1 * torch.ones(out_features, in_features), RHO_2 * torch.ones(out_features, in_features), ALPHA)
+        assert isinstance(self.weights_prior, ParameterDistribution)
+        assert not any(True for _ in self.weights_prior.parameters()), 'Prior cannot have parameters'
+
+        weight_mu = nn.Parameter(torch.Tensor(out_features, in_features).uniform_(-0.2, 0.2))
+        weight_rho = nn.Parameter(torch.Tensor(out_features, in_features).uniform_(-5, -4))
+        self.weights_var_posterior = MultivariateDiagonalGaussian(weight_mu, weight_rho)
 
         assert isinstance(self.weights_var_posterior, ParameterDistribution)
         assert any(True for _ in self.weights_var_posterior.parameters()), 'Weight posterior must have parameters'
 
         if self.use_bias:
-            # TODO: As for the weights, create the bias variational posterior instance here.
-            #  Make sure to follow the same rules as for the weight variational posterior.
-            self.bias_var_posterior = None
+            bias_mu = nn.Parameter(torch.Tensor(out_features, 1).uniform_(-0.2, 0.2))
+            bias_rho = nn.Parameter(torch.Tensor(out_features, 1).uniform_(-5, -4))
+            self.bias_var_posterior = MultivariateDiagonalGaussian(bias_mu, bias_rho)
+            self.bias_prior = ScaleMixtureMVGaussian(RHO_1 * torch.ones(out_features, 1), RHO_2 * torch.ones(out_features, 1), ALPHA)
+
             assert isinstance(self.bias_var_posterior, ParameterDistribution)
             assert any(True for _ in self.bias_var_posterior.parameters()), 'Bias posterior must have parameters'
         else:
             self.bias_var_posterior = None
+            self.bias_prior = None
 
     def forward(self, inputs: torch.Tensor):
         """
@@ -220,15 +217,18 @@ class BayesianLayer(nn.Module):
             ii) sample of the log-prior probability, and
             iii) sample of the log-variational-posterior probability
         """
-        # TODO: Perform a forward pass as described in this method's docstring.
-        #  Make sure to check whether `self.use_bias` is True,
-        #  and if yes, include the bias as well.
-        log_prior = torch.tensor(0.0)
-        log_variational_posterior = torch.tensor(0.0)
-        weights = None
-        bias = None
 
-        return F.linear(inputs, weights, bias), log_prior, log_variational_posterior
+        sample_weights = self.weights_var_posterior.sample()
+        sample_biases = torch.zeros((sample_weights.shape[0], 1))
+        log_prior = self.weights_prior.log_likelihood(sample_weights)
+        log_variational_posterior = self.weights_var_posterior.log_likelihood(sample_biases)
+
+        if self.use_bias:
+            sample_biases = self.bias_var_posterior.sample()
+            log_prior += self.bias_prior.log_likelihood(sample_biases)
+            log_variational_posterior += self.bias_var_posterior.log_likelihood(sample_biases)
+
+        return F.linear(inputs, sample_weights, sample_biases), log_prior, log_variational_posterior
 
 
 class BayesNet(nn.Module):
@@ -296,8 +296,7 @@ class BayesNet(nn.Module):
 
 class UnivariateGaussian(ParameterDistribution):
     """
-    Univariate Gaussian distribution.
-    For multivariate data, this assumes all elements to be i.i.d.
+    Univariate Gaussian distribution. For multivariate data, this assumes all elements to be i.i.d.
     """
 
     def __init__(self, mu: torch.Tensor, sigma: torch.Tensor):
@@ -307,37 +306,69 @@ class UnivariateGaussian(ParameterDistribution):
         self.mu = mu
         self.sigma = sigma
 
-    def log_likelihood(self, values: torch.Tensor) -> torch.Tensor:
-        # TODO: Implement this
-        return 0.0
+    def log_likelihood(self, value: torch.Tensor) -> torch.Tensor:
+        # Assuming single float input
+        return - 0.5 * torch.log(2 * torch.pi * torch.square(self.sigma)) - torch.square(self.mu - value) \
+               / (2 * torch.square(self.sigma))
 
     def sample(self) -> torch.Tensor:
-        # TODO: Implement this
-        raise NotImplementedError()
+        eps = np.random.normal()
+        return self.mu + self.sigma * eps
 
 
 class MultivariateDiagonalGaussian(ParameterDistribution):
     """
-    Multivariate diagonal Gaussian distribution,
-    i.e., assumes all elements to be independent Gaussians
-    but with different means and standard deviations.
-    This parameterizes the standard deviation via a parameter rho as
+    Multivariate diagonal Gaussian distribution, i.e., assumes all elements to be independent Gaussians but with
+    different means and standard deviations. This parameterizes the standard deviation via a parameter rho as
     sigma = softplus(rho).
     """
 
     def __init__(self, mu: torch.Tensor, rho: torch.Tensor):
         super(MultivariateDiagonalGaussian, self).__init__()  # always make sure to include the super-class init call!
+        # Assuming mu and rho are a 2D tensor (n x m)
         assert mu.size() == rho.size()
         self.mu = mu
         self.rho = rho
+        self.sigma = torch.log(1 + torch.exp(rho))
 
     def log_likelihood(self, values: torch.Tensor) -> torch.Tensor:
-        # TODO: Implement this
-        return 0.0
+        # Assuming values is a 2D Tensor (n x m), outputs a single log_likelihood across all dimensions
+        n, m = values.shape
+        loss = torch.sum(torch.square(values - self.mu))
+
+        return -0.5 * (n+m) * torch.log(2 * torch.pi * torch.square(self.sigma)) - loss / (2 * torch.square(self.sigma))
 
     def sample(self) -> torch.Tensor:
-        # TODO: Implement this
-        raise NotImplementedError()
+        eps = np.random.normal()
+        return self.mu + self.sigma * eps
+
+
+class ScaleMixtureMVGaussian(ParameterDistribution):
+    """
+    ScaleMixture Gaussian to implement Spike and Slab model as per Bayes by Backprop paper. Note that this
+    implementation is prone to potential underflow and the computation of the log likelihood is not optimized
+    """
+
+    def __init__(self, rho1: torch.Tensor, rho2: torch.Tensor, alpha: float):
+        super(ScaleMixtureMVGaussian, self).__init__()  # always make sure to include the super-class init call!
+        assert rho1.size() == rho2.size()
+        # Assumes mu and sigmas are 2D (n x m) as per Multivariate Gaussian
+        sigma1 = torch.log(1 + torch.exp(rho1))
+        sigma2 = torch.log(1 + torch.exp(rho2))
+        self.gaussian1 = MultivariateDiagonalGaussian(torch.zeros(sigma1.shape), sigma1)
+        self.gaussian2 = MultivariateDiagonalGaussian(torch.zeros(sigma2.shape), sigma2)
+        self.alpha = alpha
+
+    def log_likelihood(self, values: torch.Tensor) -> torch.Tensor:
+        # Assumes values are 2D (n x m) as per Multivariate Gaussian
+        likelihood = self.alpha * torch.exp(self.gaussian1.log_likelihood(values)) + \
+                     (1 - self.alpha) * torch.exp(self.gaussian2.log_likelihood(values))
+        return torch.log(likelihood)
+
+    def sample(self) -> torch.Tensor:
+        eps1 = np.random.normal()
+        eps2 = np.random.normal()
+        return self.mu + self.alpha * self.sigma1 * eps1 + (1 - self.alpha) * self.sigma2 * eps2
 
 
 def evaluate(model: Model, eval_loader: torch.utils.data.DataLoader, data_dir: str, output_dir: str):
@@ -375,7 +406,8 @@ def evaluate(model: Model, eval_loader: torch.utils.data.DataLoader, data_dir: s
                 sample_idx = most_confident_indices[5 * row // 2 + col]
                 ax[row, col].imshow(np.reshape(eval_samples[sample_idx], (28, 28)), cmap='gray')
                 ax[row, col].set_axis_off()
-                ax[row + 1, col].set_title(f'predicted {predicted_classes[sample_idx]}, actual {actual_classes[sample_idx]}')
+                ax[row + 1, col].set_title(
+                    f'predicted {predicted_classes[sample_idx]}, actual {actual_classes[sample_idx]}')
                 bar_colors = ['C0'] * 10
                 bar_colors[actual_classes[sample_idx]] = 'C1'
                 ax[row + 1, col].bar(
@@ -393,7 +425,8 @@ def evaluate(model: Model, eval_loader: torch.utils.data.DataLoader, data_dir: s
                 sample_idx = least_confident_indices[5 * row // 2 + col]
                 ax[row, col].imshow(np.reshape(eval_samples[sample_idx], (28, 28)), cmap='gray')
                 ax[row, col].set_axis_off()
-                ax[row + 1, col].set_title(f'predicted {predicted_classes[sample_idx]}, actual {actual_classes[sample_idx]}')
+                ax[row + 1, col].set_title(
+                    f'predicted {predicted_classes[sample_idx]}, actual {actual_classes[sample_idx]}')
                 bar_colors = ['C0'] * 10
                 bar_colors[actual_classes[sample_idx]] = 'C1'
                 ax[row + 1, col].bar(
@@ -403,7 +436,8 @@ def evaluate(model: Model, eval_loader: torch.utils.data.DataLoader, data_dir: s
         fig.savefig(os.path.join(output_dir, 'mnist_least_confident.pdf'))
 
         print('Plotting ambiguous and rotated MNIST confidences')
-        ambiguous_samples = torch.from_numpy(np.load(os.path.join(data_dir, 'test_x.npz'))['test_x']).reshape([-1, 784])[:10]
+        ambiguous_samples = torch.from_numpy(np.load(os.path.join(data_dir, 'test_x.npz'))['test_x']).reshape(
+            [-1, 784])[:10]
         ambiguous_dataset = torch.utils.data.TensorDataset(ambiguous_samples, torch.zeros(10))
         ambiguous_loader = torch.utils.data.DataLoader(
             ambiguous_dataset, batch_size=10, shuffle=False, drop_last=False
@@ -525,11 +559,11 @@ class DenseNet(nn.Module):
 
 
 def main():
-    raise RuntimeError(
-        'This main method is for illustrative purposes only and will NEVER be called by the checker!\n'
-        'The checker always calls run_solution directly.\n'
-        'Please implement your solution exclusively in the methods and classes mentioned in the task description.'
-    )
+    # raise RuntimeError(
+    #     'This main method is for illustrative purposes only and will NEVER be called by the checker!\n'
+    #     'The checker always calls run_solution directly.\n'
+    #     'Please implement your solution exclusively in the methods and classes mentioned in the task description.'
+    # )
 
     # Load training data
     data_dir = os.curdir
