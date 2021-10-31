@@ -57,13 +57,15 @@ class Model(object):
     def __init__(self):
         # Hyperparameters and general parameters
         # You might want to play around with those
+        NUM_SAMPLES = 5
+
         self.num_epochs = 100  # number of training epochs
         self.batch_size = 128  # training batch size
         learning_rate = 1e-3  # training learning rates
         hidden_layers = (100, 100)  # for each entry, creates a hidden layer with the corresponding number of units
         use_densenet = False  # set this to True in order to run a DenseNet for comparison
         self.print_interval = 100  # number of batches until updated metrics are displayed during training
-
+        self.num_samples = NUM_SAMPLES
         # Determine network type
         if use_densenet:
             # DenseNet
@@ -117,8 +119,13 @@ class Model(object):
                 else:
                     # BayesNet training step via Bayes by backprop
                     assert isinstance(self.network, BayesNet)
+                    loss = torch.tensor(0.)
+                    for i in range(self.num_samples):
+                        current_logits, log_prior, log_post = self.network(batch_x)
+                        data_log_like = F.nll_loss(F.log_softmax(current_logits, dim=1), batch_y, reduction='sum')
+                        loss += (log_post/num_batches - log_prior/num_batches + data_log_like)/self.num_samples
 
-                    # TODO: Implement Bayes by backprop training here
+                    loss.backward(retain_graph=True)
 
                 self.optimizer.step()
 
@@ -221,14 +228,14 @@ class BayesianLayer(nn.Module):
         sample_weights = self.weights_var_posterior.sample()
         sample_biases = torch.zeros((sample_weights.shape[0], 1))
         log_prior = self.weights_prior.log_likelihood(sample_weights)
-        log_variational_posterior = self.weights_var_posterior.log_likelihood(sample_biases)
+        log_variational_posterior = self.weights_var_posterior.log_likelihood(sample_weights)
 
         if self.use_bias:
             sample_biases = self.bias_var_posterior.sample()
             log_prior += self.bias_prior.log_likelihood(sample_biases)
             log_variational_posterior += self.bias_var_posterior.log_likelihood(sample_biases)
 
-        return F.linear(inputs, sample_weights, sample_biases), log_prior, log_variational_posterior
+        return F.linear(inputs, sample_weights, torch.squeeze(sample_biases)), log_prior, log_variational_posterior
 
 
 class BayesNet(nn.Module):
@@ -268,12 +275,20 @@ class BayesNet(nn.Module):
             iii) sample of the log-variational-posterior probability
         """
 
-        # TODO: Perform a full pass through your BayesNet as described in this method's docstring.
-        #  You can look at DenseNet to get an idea how a forward pass might look like.
-        #  Don't forget to apply your activation function in between BayesianLayers!
         log_prior = torch.tensor(0.0)
         log_variational_posterior = torch.tensor(0.0)
-        output_features = None
+
+        current_features = x
+
+        for idx, current_layer in enumerate(self.layers):
+            new_features, new_log_prior, new_log_post = current_layer(current_features)
+            log_prior += new_log_prior
+            log_variational_posterior += new_log_post
+            if idx < len(self.layers) - 1:
+                new_features = self.activation(new_features)
+            current_features = new_features
+
+        output_features = current_features
 
         return output_features, log_prior, log_variational_posterior
 
@@ -333,10 +348,9 @@ class MultivariateDiagonalGaussian(ParameterDistribution):
 
     def log_likelihood(self, values: torch.Tensor) -> torch.Tensor:
         # Assuming values is a 2D Tensor (n x m), outputs a single log_likelihood across all dimensions
-        n, m = values.shape
-        loss = torch.sum(torch.square(values - self.mu))
-
-        return -0.5 * (n+m) * torch.log(2 * torch.pi * torch.square(self.sigma)) - loss / (2 * torch.square(self.sigma))
+        DAMPING_FACTOR = 1
+        loss = torch.div(torch.square(values - self.mu), 2 * torch.square(self.sigma))
+        return torch.sum(-loss - torch.log(2 * torch.pi * torch.square(self.sigma)) / DAMPING_FACTOR)
 
     def sample(self) -> torch.Tensor:
         eps = np.random.normal()
@@ -361,9 +375,18 @@ class ScaleMixtureMVGaussian(ParameterDistribution):
 
     def log_likelihood(self, values: torch.Tensor) -> torch.Tensor:
         # Assumes values are 2D (n x m) as per Multivariate Gaussian
-        likelihood = self.alpha * torch.exp(self.gaussian1.log_likelihood(values)) + \
-                     (1 - self.alpha) * torch.exp(self.gaussian2.log_likelihood(values))
-        return torch.log(likelihood)
+        log_like_1 = self.gaussian1.log_likelihood(values)
+        log_like_2 = self.gaussian2.log_likelihood(values)
+        if log_like_2 > log_like_1 * 10:
+            log_like = log_like_2
+        elif log_like_1 > log_like_2 * 10:
+            log_like = log_like_1
+        else:
+            offset = (log_like_2 + log_like_1) / 2
+            likelihood = self.alpha * torch.exp(log_like_1 - offset) + (1 - self.alpha) * torch.exp(log_like_2 - offset)
+            log_like = torch.log(likelihood) + offset
+
+        return log_like
 
     def sample(self) -> torch.Tensor:
         eps1 = np.random.normal()
