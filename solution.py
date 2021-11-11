@@ -14,7 +14,7 @@ from tqdm import trange
 from util import ece, ParameterDistribution
 
 # Set `EXTENDED_EVALUATION` to `True` in order to visualize your predictions.
-EXTENDED_EVALUATION = True
+EXTENDED_EVALUATION = False
 
 
 def run_solution(dataset_train: torch.utils.data.Dataset, data_dir: str = os.curdir,
@@ -67,6 +67,12 @@ class Model(object):
         use_densenet = False  # set this to True in order to run a DenseNet for comparison
         self.print_interval = 100  # number of batches until updated metrics are displayed during training
         self.num_samples = NUM_SAMPLES
+
+        self.num_val_checks = 0  # simple integer counter for plotting learning curve later
+        self.val_acc = []  # validation accuracy for each training 'step'
+        self.ece_score = []  # ece score for each training 'step'
+
+
         # Determine network type
         if use_densenet:
             # DenseNet
@@ -90,8 +96,21 @@ class Model(object):
         :param dataset: Dataset you should use for training
         """
 
+        # create training and validation datasets, 80-20 split
+        training_size = 0.8
+        len_dataset = len(dataset)
+
+        len_train = round(len_dataset * 0.8)
+        len_val = round(len_dataset * (1-training_size))
+
+        dataset_train, dataset_val = torch.utils.data.random_split(dataset, lengths=[len_train, len_val])
+
         train_loader = torch.utils.data.DataLoader(
-            dataset, batch_size=self.batch_size, shuffle=True, drop_last=True
+            dataset_train, batch_size=self.batch_size, shuffle=True, drop_last=True
+        )
+
+        val_loader = torch.utils.data.DataLoader(
+            dataset_val, batch_size=self.batch_size, shuffle=False, drop_last=False
         )
 
         self.network.train()
@@ -128,6 +147,7 @@ class Model(object):
 
                     loss.backward(retain_graph=True)
 
+
                 self.optimizer.step()
 
                 # Update progress bar with accuracy occasionally
@@ -139,6 +159,19 @@ class Model(object):
                         current_logits, _, _ = self.network(batch_x)
                     current_accuracy = (current_logits.argmax(axis=1) == batch_y).float().mean()
                     progress_bar.set_postfix(loss=loss.item(), acc=current_accuracy.item())
+
+
+                    # update validation accuracy and ece score
+                    predicted_probabilities = self.predict(val_loader)
+                    predicted_classes = np.argmax(predicted_probabilities, axis=1)
+
+                    actual_classes = dataset.tensors[1][val_loader.dataset.indices].detach().numpy()
+                    accuracy = np.mean((predicted_classes == actual_classes))
+                    ece_score = ece(predicted_probabilities, actual_classes)
+
+                    self.num_val_checks += 1
+                    self.val_acc.append(accuracy)
+                    self.ece_score.append(ece_score)
 
     def predict(self, data_loader: torch.utils.data.DataLoader) -> np.ndarray:
         """
@@ -413,6 +446,16 @@ def evaluate(model: Model, eval_loader: torch.utils.data.DataLoader, data_dir: s
     accuracy = np.mean((predicted_classes == actual_classes))
     ece_score = ece(predicted_probabilities, actual_classes)
     print(f'Accuracy: {accuracy.item():.3f}, ECE score: {ece_score:.3f}')
+
+    # create learning curve
+    num_val_checks_arr = np.arange(0, model.num_val_checks, 1)
+    fig, ax = plt.subplots(1, 2, figsize=(15, 5))
+    ax[0].plot(num_val_checks_arr, model.val_acc)
+    ax[0].set_title("Validation Accuracy")
+    ax[1].plot(num_val_checks_arr, model.ece_score)
+    ax[1].set_title("ECE Score")
+
+    fig.savefig(os.path.join(output_dir, 'val_acc.pdf'))
 
     if EXTENDED_EVALUATION:
         eval_samples = eval_loader.dataset.tensors[0].detach().numpy()
