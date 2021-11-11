@@ -4,6 +4,7 @@ import typing
 import numpy as np
 import torch
 import torch.optim
+import math as m
 from matplotlib import pyplot as plt
 from sklearn.metrics import roc_auc_score, average_precision_score
 from torch import nn
@@ -13,7 +14,7 @@ from tqdm import trange
 from util import ece, ParameterDistribution
 
 # Set `EXTENDED_EVALUATION` to `True` in order to visualize your predictions.
-EXTENDED_EVALUATION = False
+EXTENDED_EVALUATION = True
 
 
 def run_solution(dataset_train: torch.utils.data.Dataset, data_dir: str = os.curdir,
@@ -59,7 +60,7 @@ class Model(object):
         # You might want to play around with those
         NUM_SAMPLES = 5
 
-        self.num_epochs = 100  # number of training epochs
+        self.num_epochs = 80  # number of training epochs
         self.batch_size = 128  # training batch size
         learning_rate = 1e-3  # training learning rates
         hidden_layers = (100, 100)  # for each entry, creates a hidden layer with the corresponding number of units
@@ -184,16 +185,16 @@ class BayesianLayer(nn.Module):
         self.use_bias = bias
 
         # Can tune these parameters if necessary
-        RHO_1 = 1.7
-        RHO_2 = 0.0001
+        RHO_1 = 0.54
+        RHO_2 = -18.4
         ALPHA = 0.5
 
         self.weights_prior = ScaleMixtureMVGaussian(RHO_1 * torch.ones(out_features, in_features), RHO_2 * torch.ones(out_features, in_features), ALPHA)
         assert isinstance(self.weights_prior, ParameterDistribution)
         assert not any(True for _ in self.weights_prior.parameters()), 'Prior cannot have parameters'
 
-        weight_mu = nn.Parameter(torch.Tensor(out_features, in_features).uniform_(-0.2, 0.2))
-        weight_rho = nn.Parameter(torch.Tensor(out_features, in_features).uniform_(-5, -4))
+        weight_mu = nn.Parameter(torch.Tensor(out_features, in_features).uniform_(-1, 1))
+        weight_rho = nn.Parameter(torch.Tensor(out_features, in_features).uniform_(-3, -2))
         self.weights_var_posterior = MultivariateDiagonalGaussian(weight_mu, weight_rho)
 
         assert isinstance(self.weights_var_posterior, ParameterDistribution)
@@ -201,7 +202,7 @@ class BayesianLayer(nn.Module):
 
         if self.use_bias:
             bias_mu = nn.Parameter(torch.Tensor(out_features, 1).uniform_(-0.2, 0.2))
-            bias_rho = nn.Parameter(torch.Tensor(out_features, 1).uniform_(-5, -4))
+            bias_rho = nn.Parameter(torch.Tensor(out_features, 1).uniform_(-4, -3))
             self.bias_var_posterior = MultivariateDiagonalGaussian(bias_mu, bias_rho)
             self.bias_prior = ScaleMixtureMVGaussian(RHO_1 * torch.ones(out_features, 1), RHO_2 * torch.ones(out_features, 1), ALPHA)
 
@@ -323,7 +324,7 @@ class UnivariateGaussian(ParameterDistribution):
 
     def log_likelihood(self, value: torch.Tensor) -> torch.Tensor:
         # Assuming single float input
-        return - 0.5 * torch.log(2 * torch.pi * torch.square(self.sigma)) - torch.square(self.mu - value) \
+        return - 0.5 * torch.log(2 * m.pi * torch.square(self.sigma)) - torch.square(self.mu - value) \
                / (2 * torch.square(self.sigma))
 
     def sample(self) -> torch.Tensor:
@@ -350,7 +351,7 @@ class MultivariateDiagonalGaussian(ParameterDistribution):
         # Assuming values is a 2D Tensor (n x m), outputs a single log_likelihood across all dimensions
         DAMPING_FACTOR = 1
         loss = torch.div(torch.square(values - self.mu), 2 * torch.square(self.sigma))
-        return torch.sum(-loss - torch.log(2 * torch.pi * torch.square(self.sigma)) / DAMPING_FACTOR)
+        return torch.sum(-loss - torch.log(2 * m.pi * torch.square(self.sigma)) / DAMPING_FACTOR)
 
     def sample(self) -> torch.Tensor:
         eps = np.random.normal()
