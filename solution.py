@@ -291,10 +291,12 @@ class BayesNet(nn.Module):
 
         feature_sizes = (in_features,) + hidden_features + (out_features,)
         num_affine_maps = len(feature_sizes) - 1
-        self.layers = nn.ModuleList([
-            BayesianLayer(feature_sizes[idx], feature_sizes[idx + 1], bias=True)
-            for idx in range(num_affine_maps)
-        ])
+        layers = []
+        for idx in range(num_affine_maps):
+            layers.append(BayesianLayer(feature_sizes[idx], feature_sizes[idx + 1], bias=True))
+            layers.append(torch.nn.BatchNorm1d(feature_sizes[idx + 1]))
+
+        self.layers = nn.ModuleList(layers)
         self.activation = nn.ReLU()
 
     def forward(self, x: torch.Tensor) -> typing.Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -315,11 +317,15 @@ class BayesNet(nn.Module):
         current_features = x
 
         for idx, current_layer in enumerate(self.layers):
-            new_features, new_log_prior, new_log_post = current_layer(current_features)
-            log_prior += new_log_prior
-            log_variational_posterior += new_log_post
-            if idx < len(self.layers) - 1:
-                new_features = self.activation(new_features)
+            if isinstance(current_layer, BayesianLayer):
+                new_features, new_log_prior, new_log_post = current_layer(current_features)
+                log_prior += new_log_prior
+                log_variational_posterior += new_log_post
+            else:
+                new_features = current_layer(current_features)
+                if idx < len(self.layers) - 1:
+                    new_features = self.activation(new_features)
+
             current_features = new_features
 
         output_features = current_features
@@ -349,8 +355,7 @@ class UnivariateGaussian(ParameterDistribution):
     """
 
     def __init__(self, mu: torch.Tensor, sigma: torch.Tensor):
-        super(UnivariateGaussian, self).__init__()  # always make sure to include the super-class init call!
-        assert mu.size() == () and sigma.size() == ()
+        super(UnivariateGaussian, self).__init__()
         assert sigma > 0
         self.mu = mu
         self.sigma = sigma
@@ -645,4 +650,5 @@ def main():
 
 
 if __name__ == "__main__":
+    # uni_gauss = UnivariateGaussian(torch.Tensor(0), torch.Tensor(1))
     main()
