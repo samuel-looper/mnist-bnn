@@ -7,3 +7,4 @@ Matplotlib==3.4.*
 torch==1.9.*
 torchvision==0.10.*
 tqdm==4.62.*
+scikit-image==0.18.*

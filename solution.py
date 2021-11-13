@@ -7,6 +7,8 @@ import torch.optim
 import math as m
 from matplotlib import pyplot as plt
 from sklearn.metrics import roc_auc_score, average_precision_score
+import skimage.transform
+import skimage.filters
 from torch import nn
 from torch.nn import functional as F
 from tqdm import trange
@@ -15,6 +17,48 @@ from util import ece, ParameterDistribution
 
 # Set `EXTENDED_EVALUATION` to `True` in order to visualize your predictions.
 EXTENDED_EVALUATION = False
+
+# Set `USE_AUGMENTED_DATA` to `True` in order to augment the training data with additional noise
+USE_AUGMENTED_DATA = True
+
+
+def augment(dataset):
+    """"""
+    PERCENT_AUGMENT = 1.0  # what percent of the dataset to augment
+    SCALE = 3  # blur scale
+
+    dataset_len = len(dataset)
+    augmented_len = int(PERCENT_AUGMENT*dataset_len)
+    
+    # pre-allocate the output numpy arrays
+    augmented_train_data = np.zeros((augmented_len, 28*28), dtype=np.float32)
+    augmented_train_labels = np.zeros((augmented_len, ), dtype=np.float32)
+
+    # iterate through random training samples and add noise
+    for ind in range(augmented_len):
+        # get a random image with replacement
+        sample_idx = np.random.randint(len(dataset))
+
+        # sample and reshape into square
+        img, label = dataset[sample_idx]
+        img = img.reshape((28, 28))
+
+        # blur and rotate the image
+        angle = np.random.randint(low=0, high=359)
+        blur = np.random.random() * SCALE
+        img = skimage.transform.rotate(img, angle)
+        img = skimage.filters.gaussian(img, blur)
+
+        # reshape into vector
+        img = img.reshape((1, 28*28))
+
+        augmented_train_data[ind, :] = img
+        augmented_train_labels[ind] = label
+    
+    # pack into a new, augmented dataset
+    x_train_aug = torch.from_numpy(augmented_train_data).reshape([-1, 784])
+    y_train_aug = torch.from_numpy(augmented_train_labels).long()
+    return torch.utils.data.TensorDataset(x_train_aug, y_train_aug)
 
 
 def run_solution(dataset_train: torch.utils.data.Dataset, data_dir: str = os.curdir,
@@ -32,6 +76,11 @@ def run_solution(dataset_train: torch.utils.data.Dataset, data_dir: str = os.cur
 
     # Create model
     model = Model()
+
+    if USE_AUGMENTED_DATA:
+        # create a noisier dataset
+        augmented_dataset = augment(dataset_train)
+        dataset_train = torch.utils.data.ConcatDataset([dataset_train, augmented_dataset])
 
     # Train the model
     print('Training model')
@@ -60,7 +109,7 @@ class Model(object):
         # You might want to play around with those
         NUM_SAMPLES = 5
 
-        self.num_epochs = 80  # number of training epochs
+        self.num_epochs = 100  # number of training epochs
         self.batch_size = 128  # training batch size
         learning_rate = 1e-3  # training learning rates
         hidden_layers = (100, 100)  # for each entry, creates a hidden layer with the corresponding number of units
@@ -69,8 +118,8 @@ class Model(object):
         self.num_samples = NUM_SAMPLES
 
         self.num_val_checks = 0  # simple integer counter for plotting learning curve later
-        self.val_acc = []  # validation accuracy for each training 'step'
-        self.ece_score = []  # ece score for each training 'step'
+        self.val_acc = []  # validation accuracy for each check
+        self.ece_score = []  # ece score for each check
 
 
         # Determine network type
@@ -97,11 +146,11 @@ class Model(object):
         """
 
         # create training and validation datasets, 80-20 split
-        training_size = 0.8
+        training_size = 0.9
         len_dataset = len(dataset)
 
-        len_train = round(len_dataset * 0.8)
-        len_val = round(len_dataset * (1-training_size))
+        len_train = round(len_dataset * training_size)
+        len_val = len_dataset - len_train
 
         dataset_train, dataset_val = torch.utils.data.random_split(dataset, lengths=[len_train, len_val])
 
@@ -109,9 +158,13 @@ class Model(object):
             dataset_train, batch_size=self.batch_size, shuffle=True, drop_last=True
         )
 
+        # create the validation loader
         val_loader = torch.utils.data.DataLoader(
             dataset_val, batch_size=self.batch_size, shuffle=False, drop_last=False
         )
+        # create this array once since it never changes
+        actual_classes = np.array([item[1] for item in val_loader.dataset])
+
 
         self.network.train()
 
@@ -160,18 +213,17 @@ class Model(object):
                     current_accuracy = (current_logits.argmax(axis=1) == batch_y).float().mean()
                     progress_bar.set_postfix(loss=loss.item(), acc=current_accuracy.item())
 
+            # # update validation accuracy and ece score
+            # predicted_probabilities = self.predict(val_loader)
+            # predicted_classes = np.argmax(predicted_probabilities, axis=1)
 
-                    # update validation accuracy and ece score
-                    predicted_probabilities = self.predict(val_loader)
-                    predicted_classes = np.argmax(predicted_probabilities, axis=1)
+            # # actual_classes = dataset.tensors[1][val_loader.dataset.indices].detach().numpy()
+            # accuracy = np.mean((predicted_classes == actual_classes))
+            # ece_score = ece(predicted_probabilities, actual_classes)
 
-                    actual_classes = dataset.tensors[1][val_loader.dataset.indices].detach().numpy()
-                    accuracy = np.mean((predicted_classes == actual_classes))
-                    ece_score = ece(predicted_probabilities, actual_classes)
-
-                    self.num_val_checks += 1
-                    self.val_acc.append(accuracy)
-                    self.ece_score.append(ece_score)
+            # self.num_val_checks += 1
+            # self.val_acc.append(accuracy)
+            # self.ece_score.append(ece_score)
 
     def predict(self, data_loader: torch.utils.data.DataLoader) -> np.ndarray:
         """
@@ -294,7 +346,7 @@ class BayesNet(nn.Module):
         layers = []
         for idx in range(num_affine_maps):
             layers.append(BayesianLayer(feature_sizes[idx], feature_sizes[idx + 1], bias=True))
-            layers.append(torch.nn.BatchNorm1d(feature_sizes[idx + 1]))
+            # layers.append(torch.nn.BatchNorm1d(feature_sizes[idx + 1]))
 
         self.layers = nn.ModuleList(layers)
         self.activation = nn.ReLU()
@@ -323,8 +375,8 @@ class BayesNet(nn.Module):
                 log_variational_posterior += new_log_post
             else:
                 new_features = current_layer(current_features)
-                if idx < len(self.layers) - 1:
-                    new_features = self.activation(new_features)
+            if idx < len(self.layers) - 1:
+                new_features = self.activation(new_features)
 
             current_features = new_features
 
@@ -447,20 +499,26 @@ def evaluate(model: Model, eval_loader: torch.utils.data.DataLoader, data_dir: s
 
     # Calculate evaluation metrics
     predicted_classes = np.argmax(predicted_probabilities, axis=1)
-    actual_classes = eval_loader.dataset.tensors[1].detach().numpy()
+    # actual_classes = eval_loader.dataset.tensors[1].detach().numpy()
+    # EDIT: to deal with concatenated datasets
+    actual_classes = torch.cat([dataset.tensors[1] for dataset in eval_loader.dataset.datasets]).detach().numpy()
     accuracy = np.mean((predicted_classes == actual_classes))
     ece_score = ece(predicted_probabilities, actual_classes)
     print(f'Accuracy: {accuracy.item():.3f}, ECE score: {ece_score:.3f}')
 
-    # create learning curve
-    num_val_checks_arr = np.arange(0, model.num_val_checks, 1)
-    fig, ax = plt.subplots(1, 2, figsize=(15, 5))
-    ax[0].plot(num_val_checks_arr, model.val_acc)
-    ax[0].set_title("Validation Accuracy")
-    ax[1].plot(num_val_checks_arr, model.ece_score)
-    ax[1].set_title("ECE Score")
-
-    fig.savefig(os.path.join(output_dir, 'val_acc.pdf'))
+    # # create learning curve
+    # num_val_checks_arr = np.arange(0, model.num_val_checks, 1)
+    # fig, ax = plt.subplots(1, 2, figsize=(15, 5))
+    # ax[0].plot(num_val_checks_arr, model.val_acc)
+    # ax[0].set_title("Validation Accuracy")
+    # ax[1].plot(num_val_checks_arr, model.ece_score)
+    # ax[1].set_title("ECE Score")
+    # try:
+    #     ax[0].set_xlabel("Epochs")
+    #     ax[1].set_xlabel("Epochs")
+    # except:
+    #     pass
+    # fig.savefig(os.path.join(output_dir, 'val_acc.pdf'))
 
     if EXTENDED_EVALUATION:
         eval_samples = eval_loader.dataset.tensors[0].detach().numpy()
