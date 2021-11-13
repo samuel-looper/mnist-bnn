@@ -1,0 +1,5 @@
+results_check.byte
+*.pdf
+*.npz
+*.bytes
+__pycache__
